@@ -15,7 +15,7 @@
 
 from ..._common import default_net
 from ..._utils import pad_vocab_size
-from ...functional import Tensor, concat, shape
+from ...functional import Tensor, concat, shape, gelu
 from ...layers import (MLP, Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, KeyValueCacheParams, LayerNorm,
                        RmsNorm)
@@ -279,6 +279,46 @@ class ChatGLMModel(Module):
             return (hidden_states, tuple(presents))
         return hidden_states
 
+class ChatGLMLMHead(Module):
+    def __init__(self
+                 hidden_size,
+                 vocab_size,
+                 bias=True,
+                 dtype=None,
+                 tp_group=None,
+                 tp_size=1):
+        super().__init__()
+        
+        self.fc = ColumnLinear(
+            hidden_size,
+            hidden_size,
+            bias=True,
+            dtype=dtype,
+            tp_group=None,
+            tp_size=1
+        )
+        self.layernorm = LayerNorm(
+            normalized_shape=hidden_size,
+            elementwise_affine=True,
+            dtype=dtype
+        )
+        self.proj = ColumnLinear(
+            hidden_size,
+            vocab_size,
+            bias=True,
+            dtype=dtype,
+            tp_group=None,
+            tp_size=1
+        )
+        self.dtype = dtype
+
+    def forward(self, hidden_states):
+        hidden_states = self.fc(hidden_states)
+        hidden_states = gelu(hidden_states)
+        hidden_states = self.layernorm(hidden_states)
+        logits = self.proj(hidden_states)
+
+        return logits
 
 class ChatGLMForCausalLM(DecoderModelForCausalLM):
 
@@ -291,16 +331,10 @@ class ChatGLMForCausalLM(DecoderModelForCausalLM):
         share_weight = None
         if config.share_embedding_table:
             share_weight = transformer.vocab_embedding.weight
-
-        lm_head = ColumnLinear(
+        lm_head = ChatGLMLMHead(
             config.hidden_size,
-            vocab_size_padded,
-            bias=False,
-            dtype=config.dtype,
-            tp_group=config.mapping.tp_group,
-            tp_size=config.mapping.tp_size,
-            gather_output=True,
-            share_weight=share_weight,
+            config.output_vocab_size,
+            dtype=config.dtype
         )
         super().__init__(config, transformer, lm_head)
 

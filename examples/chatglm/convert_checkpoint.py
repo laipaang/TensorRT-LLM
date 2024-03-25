@@ -285,8 +285,8 @@ def get_tllm_linear_weight(
     return results
 
 
-def convert_hf_chatglm(hf_model: AutoModel,
-                       hf_config: AutoConfig,
+def convert_hf_chatglm(hf_model,#: AutoModel,
+                       hf_config,#: AutoConfig,
                        chatglm_version: str,
                        mapping: Mapping,
                        dtype: str = 'float32',
@@ -298,7 +298,7 @@ def convert_hf_chatglm(hf_model: AutoModel,
     weights = {}
     tik = time.time()
 
-    model_params = dict(hf_model.named_parameters())
+    # model_params = dict(hf_model.named_parameters())
     dtype = getattr(torch, dtype)
     num_attention_heads = hf_config.num_attention_heads
     hidden_size = hf_config.hidden_size
@@ -440,8 +440,12 @@ def convert_hf_chatglm(hf_model: AutoModel,
 
     if mapping.is_last_pp_rank():
         if chatglm_version == 'glm':
-            lm_head_weight = get_weight(model_params, 'word_embeddings',
-                                        dtype).clone()
+            weights['lm_head.fc.weight'], weights['lm_head.fc.bias'] = get_weight_and_bias(
+                model_params, f'lm_head.transform', dtype)
+            weights['lm_head.layernorm.weight'], weights['lm_head.layernorm.bias'] = get_weight_and_bias(
+                model_params, f'lm_head.layernorm', dtype)
+            weights['lm_head.decoder.weight'], weights['lm_head.decoder.bias'] = get_weight_and_bias(
+                model_params, f'lm_head.decoder', dtype)
         elif chatglm_version == 'chatglm':
             lm_head_weight = get_weight(model_params,
                                         'transformer.word_embeddings',
@@ -451,7 +455,7 @@ def convert_hf_chatglm(hf_model: AutoModel,
                                         'transformer.output_layer', dtype)
             assert not share_embedding_table
 
-        if not share_embedding_table:
+        if chatglm_version != 'glm' and not share_embedding_table:
             weights['lm_head.weight'] = split(lm_head_weight,
                                               mapping.tp_size,
                                               mapping.tp_rank,
@@ -1097,8 +1101,14 @@ if __name__ == '__main__':
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
-    hf_config, chatglm_version = load_chatglm_config(args.model_dir,
-                                                     args.chatglm_version)
+    # hf_config, chatglm_version = load_chatglm_config(args.model_dir,
+    #                                                  args.chatglm_version)
+    with open("zeus/config.json", "r") as f:
+        import namedtuple
+        hf_config = json.load(f)
+        hf_config.pop("name_or_path")
+        HFConfig = namedtuple("HFConfig", hf_config)
+        hf_config = HFConfig(**hf_config)
 
     if chatglm_version == 'glm':
         position_embedding_type = 'learned_absolute'
@@ -1185,11 +1195,12 @@ if __name__ == '__main__':
                           tp_size=args.tp_size,
                           pp_size=args.pp_size)
 
-        hf_model = AutoModel.from_pretrained(
-            args.model_dir,
-            trust_remote_code=True,
-            torch_dtype="auto",
-            device_map="auto" if chatglm_version != 'glm' else None)
+        # hf_model = AutoModel.from_pretrained(
+        #     args.model_dir,
+        #     trust_remote_code=True,
+        #     torch_dtype="auto",
+        #     device_map="auto" if chatglm_version != 'glm' else None)
+        hf_model = torch.load('zeus/zeus-1.5b.bin')
 
         if args.smoothquant is not None or args.int8_kv_cache:
             os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
