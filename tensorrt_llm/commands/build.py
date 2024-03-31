@@ -199,6 +199,7 @@ def build_model(model: PretrainedModel, build_config: BuildConfig) -> Engine:
 
         if build_config.enable_debug_output:
             for k, v in model.named_network_outputs():
+                #print('mark ', k)
                 network._mark_output(v, k, str_dtype_to_trt(model.config.dtype))
 
     optimize(network)
@@ -254,6 +255,7 @@ def build(build_config: BuildConfig,
                 f'Unsupported model architecture: {architecture}')
         model_cls = MODEL_MAP[architecture]
 
+    logger.info('model cls %s' % model_cls)
     rank_config = copy.deepcopy(model_config)
     rank_config.set_rank(rank)
 
@@ -373,7 +375,8 @@ def preprocess_weights(
 
     # For shared embedding.
     if model_config.mapping.is_last_pp_rank(
-    ) and 'lm_head.weight' not in weights:
+    ) and 'lm_head.weight' not in weights \
+      and model_config.chatglm_version != 'glm':
         weights["lm_head.weight"] = weights[
             "transformer.vocab_embedding.weight"].clone()
 

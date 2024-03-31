@@ -3610,6 +3610,7 @@ def gpt_attention(
         The tensor produced by that layer.
     '''
     assert host_request_types is not None
+    # print('host_request_types',host_request_types)
     assert (alibi_slopes is not None) == (position_embedding_type.is_alibi())
     attn_plg_creator = trt.get_plugin_registry().get_plugin_creator(
         'GPTAttention', '1', TRT_LLM_PLUGIN_NAMESPACE)
@@ -3662,10 +3663,12 @@ def gpt_attention(
         "rotary_embedding_max_positions",
         np.array(rotary_embedding_max_positions, dtype=np.int32),
         trt.PluginFieldType.INT32)
+    # print('position_embedding_type 0', position_embedding_type )
     position_embedding_type = trt.PluginField(
         "position_embedding_type",
         np.array(int(position_embedding_type), dtype=np.int8),
         trt.PluginFieldType.INT8)
+    # print('position_embedding_type 1', position_embedding_type )
     context_fmha_type = trt.PluginField(
         "context_fmha_type",
         np.array(np.int8(default_net().plugin_config.context_fmha_type),
@@ -3682,9 +3685,11 @@ def gpt_attention(
     pf_type = trt.PluginField(
         "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
         trt.PluginFieldType.INT32)
+    print('mask_type 0', mask_type)
     mask_type = trt.PluginField("mask_type", np.array([int(mask_type)],
                                                       np.int32),
                                 trt.PluginFieldType.INT32)
+    print('mask_type 1', mask_type)
     multi_block_mode = trt.PluginField(
         "multi_block_mode",
         np.array(np.int8(default_net().plugin_config.multi_block_mode),

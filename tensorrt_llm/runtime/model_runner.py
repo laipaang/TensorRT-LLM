@@ -466,7 +466,7 @@ class ModelRunner(ModelRunnerMixin):
                 session_cls = GenerationSession
             engine_buffer = engine.engine
             runtime_mapping = pretrained_config.mapping
-
+        print('session_cls', session_cls)
         if medusa_choices is not None:
             assert session_cls == GenerationSession, "Medusa is only supported by GenerationSession"
 
@@ -607,6 +607,7 @@ class ModelRunner(ModelRunnerMixin):
         batch_input_ids, input_lengths = self._prepare_inputs(
             batch_input_ids, sampling_config.pad_id)
 
+        print('wlwp max_attention_window_size', sampling_config.max_attention_window_size)
         self.session.setup(
             batch_size=batch_size,
             max_context_length=input_lengths.max().item(),

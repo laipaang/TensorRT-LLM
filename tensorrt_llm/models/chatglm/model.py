@@ -44,11 +44,13 @@ class ChatGLMDecoderLayer(Module):
         norm_cls = RmsNorm if config.rmsnorm else LayerNorm
 
         if config.chatglm_version == 'glm':
-            attention_mask_type = AttentionMaskType.bidirectionalglm
+            attention_mask_type = AttentionMaskType.causal
         elif config.chatglm_version == 'chatglm':
             attention_mask_type = AttentionMaskType.bidirectional
         elif config.chatglm_version in ['chatglm2', 'chatglm3']:
             attention_mask_type = AttentionMaskType.causal
+        if layer_idx == 0:
+            print('wlp jsjsjsjsjsj ', attention_mask_type)
 
         self.input_layernorm = norm_cls(
             normalized_shape=hidden_size,
@@ -126,7 +128,7 @@ class ChatGLMDecoderLayer(Module):
 
         if use_cache:
             attention_output, presents = attention_output
-
+        self.register_network_output('attention_output', attention_output)
         if self.chatglm_version == 'chatglm':
             residual = norm_output
 
@@ -144,15 +146,16 @@ class ChatGLMDecoderLayer(Module):
             residual = norm_output if self.apply_residual_connection_post_layernorm else hidden_states
 
             norm_input = residual + attention_output
-
+            self.register_network_output('norm residual', norm_input)
             norm_output = self.post_layernorm(norm_input)
+            self.register_network_output('norm 2', norm_output)
 
             mlp_output = self.mlp(norm_output)
 
             residual = norm_output if self.apply_residual_connection_post_layernorm else norm_input
 
             output = residual + mlp_output
-
+        self.register_network_output('block_output', output)
         if use_cache:
             return (output, presents)
         return output
@@ -214,6 +217,10 @@ class ChatGLMModel(Module):
     ):
         hidden_states = self.vocab_embedding(input_ids)
 
+        # self.register_network_output('input_ids', input_ids)
+        # self.register_network_output('position_ids', position_ids)
+        # self.register_network_output('attention_mask', attention_mask)
+
         if self.chatglm_version == 'glm':
             if default_net().plugin_config.remove_input_padding:
                 position_ids_list = position_ids.split(1, dim=0)
@@ -223,6 +230,8 @@ class ChatGLMModel(Module):
             position_embedding = self.position_embedding(position_ids_list[0])
             block_embedding = self.block_embedding(position_ids_list[1])
             position_embedding = position_embedding + block_embedding
+
+            self.register_network_output('position_embedding', position_embedding)
 
             if default_net().plugin_config.remove_input_padding:
                 position_embedding = position_embedding.view(
@@ -239,6 +248,7 @@ class ChatGLMModel(Module):
                     ]))
 
             hidden_states = hidden_states + position_embedding
+            self.register_network_output('embedding', hidden_states)
 
         kv_cache_params.fill_none_tensor_list(len(self.layers))
 
@@ -274,13 +284,14 @@ class ChatGLMModel(Module):
                 presents.append(layer_output[1])
 
         hidden_states = self.ln_f(hidden_states)
+        self.register_network_output('output', hidden_states)
 
         if use_cache:
             return (hidden_states, tuple(presents))
         return hidden_states
 
 class ChatGLMLMHead(Module):
-    def __init__(self
+    def __init__(self,
                  hidden_size,
                  vocab_size,
                  bias=True,
@@ -318,6 +329,8 @@ class ChatGLMLMHead(Module):
         hidden_states = self.layernorm(hidden_states)
         logits = self.proj(hidden_states)
 
+        #self.register_network_output('logits', logits)
+
         return logits
 
 class ChatGLMForCausalLM(DecoderModelForCausalLM):
@@ -325,15 +338,15 @@ class ChatGLMForCausalLM(DecoderModelForCausalLM):
     def __init__(self, config: PretrainedConfig):
         self.check_config(config)
         transformer = ChatGLMModel(config)
-        vocab_size_padded = pad_vocab_size(config.vocab_size,
+        vocab_size_padded = pad_vocab_size(config.output_vocab_size,
                                            config.mapping.tp_size)
 
-        share_weight = None
-        if config.share_embedding_table:
-            share_weight = transformer.vocab_embedding.weight
+        # share_weight = None
+        # if config.share_embedding_table:
+        #     share_weight = transformer.vocab_embedding.weight
         lm_head = ChatGLMLMHead(
             config.hidden_size,
-            config.output_vocab_size,
+            vocab_size_padded,
             dtype=config.dtype
         )
         super().__init__(config, transformer, lm_head)

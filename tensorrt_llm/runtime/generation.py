@@ -669,6 +669,9 @@ class GenerationSession(object):
         if self.debug_mode:
             self.debug_tensors = list(
                 set(found_tensor_names) - set(expected_tensor_names))
+            # logger.warning('found_tensor_names %s' % found_tensor_names)
+            # logger.warning('expected_tensor_names %s' % expected_tensor_names)
+            logger.warning('self.debug_tensors %s' % self.debug_tensors)
 
     @property
     def vocab_size(self):
@@ -1114,6 +1117,7 @@ class GenerationSession(object):
         self.max_context_length = max_context_length
         self.max_new_tokens = max_new_tokens
         self.max_seq_length = max_context_length + max_new_tokens
+        print('max_context_length + max_new_tokens', max_context_length, max_new_tokens)
         if medusa_choices is not None:
             self.max_seq_length += self._model_config.max_medusa_tokens
         self.beam_width = beam_width
@@ -1128,6 +1132,7 @@ class GenerationSession(object):
                     (1, ), dtype=torch.int32) * self.max_attention_window_size
                 for i in range(self.num_layers)
             ]
+            print('wlp if max_attention_window_size is None:', self.max_attention_window_size)
         elif isinstance(max_attention_window_size, int):
             if max_attention_window_size > self.max_seq_length:
                 logger.warning(
@@ -2196,6 +2201,10 @@ class GenerationSession(object):
                     x.to('cuda') for x in host_kv_cache_block_pointers
                 ]
 
+            logger.info('input_ids %s' % input_ids)
+            logger.info('position_ids %s' % position_ids)
+            logger.info('mask %s' % attention_mask)
+            # torch.cuda.synchronize()
             ctx_tensors = self._get_context_shape_buffer(
                 input_ids, context_lengths, host_context_lengths, position_ids,
                 last_token_ids, attention_mask, cross_attention_mask,
@@ -2232,7 +2241,24 @@ class GenerationSession(object):
         if not ok:
             raise RuntimeError(f"Executing TRT engine failed step={step}!")
         if self.debug_mode:
+            if step == 0:
+                logger.info('debug_buffer key %s' % self.debug_buffer.keys())
             torch.cuda.synchronize()
+            if step == 0:
+                logger.info(f"logits {self.buffer['logits']}")
+                # logger.info(f"logits2 {self.buffer['lm_head.logits']}")
+                keys = ['input_ids', 'position_ids', 'sequence_length', 'context_lengths', 'transformer.position_embedding', 'transformer.embedding']
+                for i in range(48):
+                    keys.append(f'transformer.layers.{i}.attention.attention_qkv')
+                    keys.append(f'transformer.layers.{i}.attention.attention_proj')
+                    keys.append(f'transformer.layers.{i}.attention_output')
+                    keys.append(f"transformer.layers.{i}.norm residual")
+                    keys.append(f"transformer.layers.{i}.norm 2")
+                    keys.append(f"transformer.layers.{i}.block_output")
+                keys.append('transformer.output')
+                keys.append('lm_head.logits')
+                for _ in keys:
+                    pass#logger.info(f"{_} {self.debug_buffer[_]}")
 
         context_logits = None
         if self.mapping.is_last_pp_rank():
@@ -2378,6 +2404,7 @@ class GenerationSession(object):
         logits = None
         if self.mapping.is_last_pp_rank():
             logits = self.buffer['logits']
+            print('wlp logits', logits)
             if logits is not None:
                 if self.is_medusa_mode:
                     should_stop = self.process_logits_for_medusa_mode(
@@ -2990,6 +3017,7 @@ class ChatGLMGenerationSession(GenerationSession):
         if not use_gpt_attention_plugin:
             attention_mask = torch.zeros((batch_size, 1))
             inputs['attention_mask'] = attention_mask
+        print('inputs', inputs)
         return inputs
 
     def _prepare_generation_inputs(self, batch_size, context_lengths,

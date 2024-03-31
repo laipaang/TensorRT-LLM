@@ -585,6 +585,7 @@ class Attention(Module):
                 position_embedding=None,
                 norm_before_bmm1=False,
                 lora_layer_params=None):
+        print('wlp sjjsjss attention forward')
 
         assert isinstance(hidden_states, Tensor)
 
@@ -726,7 +727,9 @@ class Attention(Module):
         if self.cross_attention and encoder_output:
             cross_qkv = self.qkv(encoder_output)
 
+        self.register_network_output('attention_qkv', qkv)
         if default_net().plugin_config.gpt_attention_plugin:
+            print('use wlp default_net().plugin_config.gpt_attention_plugin', self.attention_mask_type)
             if self.cross_attention and (past_key_value is not None):
                 past_key_value = kv_cache_params.past_key_value[1]
             assert self.attention_mask_type in [
@@ -1082,6 +1085,7 @@ class Attention(Module):
         if lora_layer_params is not None:
             dense_lora_params = lora_layer_params.get_runtime_params(
                 0, "attn_dense")
+        self.register_network_output('attention_proj', context)
         context = self.dense(context, lora_runtime_params=dense_lora_params)
 
         if use_cache:

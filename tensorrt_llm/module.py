@@ -154,6 +154,7 @@ class Module(object):
             self._parameters[name] = param
 
     def register_network_output(self, name, value):
+        return
         self._network_outputs[name] = value
 
     def named_network_outputs(self):

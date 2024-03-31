@@ -299,6 +299,7 @@ def convert_hf_chatglm(hf_model,#: AutoModel,
     tik = time.time()
 
     # model_params = dict(hf_model.named_parameters())
+    model_params = hf_model
     dtype = getattr(torch, dtype)
     num_attention_heads = hf_config.num_attention_heads
     hidden_size = hf_config.hidden_size
@@ -444,7 +445,7 @@ def convert_hf_chatglm(hf_model,#: AutoModel,
                 model_params, f'lm_head.transform', dtype)
             weights['lm_head.layernorm.weight'], weights['lm_head.layernorm.bias'] = get_weight_and_bias(
                 model_params, f'lm_head.layernorm', dtype)
-            weights['lm_head.decoder.weight'], weights['lm_head.decoder.bias'] = get_weight_and_bias(
+            weights['lm_head.proj.weight'], weights['lm_head.proj.bias'] = get_weight_and_bias(
                 model_params, f'lm_head.decoder', dtype)
         elif chatglm_version == 'chatglm':
             lm_head_weight = get_weight(model_params,
@@ -1104,11 +1105,11 @@ if __name__ == '__main__':
     # hf_config, chatglm_version = load_chatglm_config(args.model_dir,
     #                                                  args.chatglm_version)
     with open("zeus/config.json", "r") as f:
-        import namedtuple
+        from collections import namedtuple
         hf_config = json.load(f)
-        hf_config.pop("name_or_path")
         HFConfig = namedtuple("HFConfig", hf_config)
         hf_config = HFConfig(**hf_config)
+        chatglm_version = 'glm'
 
     if chatglm_version == 'glm':
         position_embedding_type = 'learned_absolute'
@@ -1128,6 +1129,7 @@ if __name__ == '__main__':
         'intermediate_size': hf_config.ffn_hidden_size,
         'norm_epsilon': hf_config.layernorm_epsilon,
         'vocab_size': hf_config.vocab_size,
+        'output_vocab_size': hf_config.output_vocab_size,
         'position_embedding_type': position_embedding_type,
         'max_position_embeddings': hf_config.max_position_embeddings,
         'hidden_act': hf_config.hidden_act,
@@ -1255,7 +1257,8 @@ if __name__ == '__main__':
 
         del hf_model
 
-        safetensors.torch.save_file(
+        from safetensors.torch import save_file
+        save_file(
             weights, os.path.join(args.output_dir, f'rank{rank}.safetensors'))
 
     if args.workers == 1:
