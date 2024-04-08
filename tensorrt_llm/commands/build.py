@@ -373,7 +373,8 @@ def preprocess_weights(
 
     # For shared embedding.
     if model_config.mapping.is_last_pp_rank(
-    ) and 'lm_head.weight' not in weights:
+    ) and 'lm_head.weight' not in weights \
+      and model_config.chatglm_version != 'glm':
         weights["lm_head.weight"] = weights[
             "transformer.vocab_embedding.weight"].clone()
 

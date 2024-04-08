@@ -415,7 +415,7 @@ class ModelRunner(ModelRunnerMixin):
 
             model_config = ModelConfig(
                 max_batch_size=build_config.max_batch_size,
-                vocab_size=pretrained_config.vocab_size,
+                vocab_size=pretrained_config.output_vocab_size,
                 num_layers=pretrained_config.num_hidden_layers,
                 num_heads=num_heads,
                 num_kv_heads=num_kv_heads,
