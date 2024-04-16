@@ -106,7 +106,7 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     head_size = builder_config.get('head_size', None)
 
     hidden_size = builder_config['hidden_size'] // tp_size
-    vocab_size = builder_config['vocab_size']
+    vocab_size = builder_config['output_vocab_size']
     num_layers = builder_config['num_layers']
     max_batch_size = builder_config['max_batch_size']
     max_beam_width = builder_config['max_beam_width']

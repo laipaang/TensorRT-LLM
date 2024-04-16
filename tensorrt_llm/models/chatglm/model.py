@@ -15,7 +15,7 @@
 
 from ..._common import default_net
 from ..._utils import pad_vocab_size
-from ...functional import Tensor, concat, shape
+from ...functional import Tensor, concat, shape, gelu
 from ...layers import (MLP, Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, KeyValueCacheParams, LayerNorm,
                        RmsNorm)
@@ -46,7 +46,7 @@ class ChatGLMDecoderLayer(Module):
         norm_cls = RmsNorm if config.rmsnorm else LayerNorm
 
         if config.chatglm_version == 'glm':
-            attention_mask_type = AttentionMaskType.bidirectionalglm
+            attention_mask_type = AttentionMaskType.bidirectional
         elif config.chatglm_version == 'chatglm':
             attention_mask_type = AttentionMaskType.bidirectional
         elif config.chatglm_version == 'chatglm2':
@@ -257,21 +257,68 @@ class ChatGLMModel(Module):
         return hidden_states
 
 
+class ChatGLMLMHead(Module):
+    def __init__(self,
+                 hidden_size,
+                 vocab_size,
+                 bias=True,
+                 dtype=None,
+                 tp_group=None,
+                 tp_size=1):
+        super().__init__()
+
+        self.fc = ColumnLinear(
+            hidden_size,
+            hidden_size,
+            bias=True,
+            dtype=dtype,
+            tp_group=None,
+            tp_size=1
+        )
+        self.layernorm = LayerNorm(
+            normalized_shape=hidden_size,
+            elementwise_affine=True,
+            dtype=dtype
+        )
+        self.proj = ColumnLinear(
+            hidden_size,
+            vocab_size,
+            bias=True,
+            dtype=dtype,
+            tp_group=None,
+            tp_size=1
+        )
+        self.dtype = dtype
+
+    def forward(self, hidden_states):
+        hidden_states = self.fc(hidden_states)
+        hidden_states = gelu(hidden_states)
+        hidden_states = self.layernorm(hidden_states)
+        logits = self.proj(hidden_states)
+
+        return logits
+
+
 class ChatGLMForCausalLM(DecoderModelForCausalLM):
 
     def __init__(self, config: PretrainedConfig):
         self.check_config(config)
         transformer = ChatGLMModel(config)
-        vocab_size_padded = pad_vocab_size(config.vocab_size,
+        vocab_size_padded = pad_vocab_size(config.output_vocab_size,
                                            config.mapping.tp_size)
 
-        lm_head = ColumnLinear(config.hidden_size,
-                               vocab_size_padded,
-                               bias=False,
-                               dtype=config.dtype,
-                               tp_group=config.mapping.tp_group,
-                               tp_size=config.mapping.tp_size,
-                               gather_output=True)
+        # lm_head = ColumnLinear(config.hidden_size,
+        #                        vocab_size_padded,
+        #                        bias=False,
+        #                        dtype=config.dtype,
+        #                        tp_group=config.mapping.tp_group,
+        #                        tp_size=config.mapping.tp_size,
+        #                        gather_output=True)
+        lm_head = ChatGLMLMHead(
+            config.hidden_size,
+            vocab_size_padded,
+            dtype=config.dtype
+        )
         super().__init__(config, transformer, lm_head)
 
     def check_config(self, config: PretrainedConfig):

@@ -116,6 +116,7 @@ def parse_arguments(args=None):
     parser.add_argument('--length_penalty', type=float, default=1.0)
     parser.add_argument('--repetition_penalty', type=float, default=1.0)
     parser.add_argument('--presence_penalty', type=float, default=0.0)
+    parser.add_argument('--beam_search_diversity_rate', type=float, default=0.0)
     parser.add_argument('--frequency_penalty', type=float, default=0.0)
     parser.add_argument('--early_stopping',
                         type=int,
@@ -242,7 +243,7 @@ def parse_input(tokenizer,
 
     if model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
         for ids in batch_input_ids:
-            ids.append(tokenizer.sop_token_id)
+            ids.append(tokenizer.bos_token_id)
 
     batch_input_ids = [
         torch.tensor(x, dtype=torch.int32) for x in batch_input_ids
@@ -344,13 +345,18 @@ def main(args):
         )
         args.tokenizer_dir = DEFAULT_HF_MODEL_DIRS[model_name]
 
-    tokenizer, pad_id, end_id = load_tokenizer(
-        tokenizer_dir=args.tokenizer_dir,
-        vocab_file=args.vocab_file,
-        model_name=model_name,
-        model_version=model_version,
-        tokenizer_type=args.tokenizer_type,
-    )
+    # tokenizer, pad_id, end_id = load_tokenizer(
+    #     tokenizer_dir=args.tokenizer_dir,
+    #     vocab_file=args.vocab_file,
+    #     model_name=model_name,
+    #     model_version=model_version,
+    #     tokenizer_type=args.tokenizer_type,
+    # )
+    print('\nzeus tokenizer....')
+    from zeus.tokenization_zeus import ZeusTokenizer
+    tokenizer = ZeusTokenizer.from_pretrained('zeus/vocab.txt')
+    pad_id = tokenizer.pad_token_id
+    end_id = tokenizer.eos_token_id
 
     # # An example to stop generation when the model generate " London" on first sentence, " eventually became" on second sentence
     # stop_words_list = [[" London"], ["eventually became"]]
@@ -424,6 +430,7 @@ def main(args):
             top_k=args.top_k,
             top_p=args.top_p,
             num_beams=args.num_beams,
+            beam_search_diversity_rate=args.beam_search_diversity_rate,
             length_penalty=args.length_penalty,
             early_stopping=args.early_stopping,
             repetition_penalty=args.repetition_penalty,
