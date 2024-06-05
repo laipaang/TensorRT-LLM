@@ -70,7 +70,8 @@ def weight_only_quantize_dict(weights: Dict[str, torch.Tensor],
         return weights
     for name in list(weights):
         if any([_name in name for _name in quant_weights
-                ]) and weights[name].dtype != torch.int8:
+                ]) and weights[name].dtype != torch.int8 \
+                   and 'lm_head' not in name:
             quant_weight, quant_scale = weight_only_quantize(
                 weight=weights[name], quant_algo=quant_algo, plugin=plugin)
             weights[name] = quant_weight
