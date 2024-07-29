@@ -78,7 +78,7 @@ __global__ void updateIndirCacheKernel(int* tgt_indir_cache, int const* src_indi
 {
     // Update indirections from steps `input_length[bb_id]` to step `sequence_lengths[bb_id]`
     int const time_step = threadIdx.x + blockIdx.x * blockDim.x;
-    int const bb_id = threadIdx.y + blockIdx.y * blockDim.y; // should be just blockIdx.y?
+    int const bb_id = blockIdx.y;
     int const beam_width{bh.beam_width};
     int const batch_id = bb_id / beam_width;
     int const beam_id = bb_id % beam_width;
@@ -131,7 +131,7 @@ void BeamSearchLayer<T>::forward(OutputParams& op, ForwardParams const& fp)
     TLLM_CHECK_WITH_INFO(fp.ite == 0, "Pipeline Parallelism is not supported yet !");
 
     BeamHypotheses& bh{*op.beamHypotheses};
-    bh.batch_size = static_cast<std::int32_t>(fp.end_ids.shape[0]);
+    bh.batch_size = static_cast<std::int32_t>(op.output_ids_ptr.shape[0]);
     bh.beam_width = static_cast<std::int32_t>(op.output_ids_ptr.shape[1]);
     bh.ite = fp.ite;
     bh.local_batch_size = fp.logits.shape[0];
@@ -176,7 +176,7 @@ void BeamSearchLayer<T>::allocateBuffer(runtime::SizeType const batch_size, runt
     int const nPadBeamWidth = padToNextPowerOfTwo(beam_width);
     // Unit of mWorkspaceSize is number of elements (not Byte), align to 4 for further optimization
     size_t nTopK = batch_size * nPadBeamWidth * nPadBeamWidth * 2;
-    size_t nTempBuffer = batch_size * nPadBeamWidth * nSmallTopKMaxVocParts * (2 * (nPadBeamWidth * 2) + 2);
+    size_t nTempBuffer = batch_size * nPadBeamWidth * nMaxVocabPartForStage1FastKernel * (2 * (nPadBeamWidth * 2) + 2);
     mWorkspaceSize = roundUp(nTopK, 4) * 2 + roundUp(nTempBuffer, 4);
     mWorkspace = mAllocator->reMalloc(mWorkspace, sizeof(float) * mWorkspaceSize, true);
     mDiversityRateDevice = mAllocator->reMalloc(mDiversityRateDevice, sizeof(float) * batch_size, false);

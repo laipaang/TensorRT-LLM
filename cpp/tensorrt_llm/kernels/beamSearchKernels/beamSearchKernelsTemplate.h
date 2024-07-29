@@ -57,7 +57,6 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
     float const diversity_rate{bh.diversity_rates[gbid]};
     float const length_penalty{bh.length_penalties[gbid]};
     int const early_stopping{bh.early_stoppings[gbid]};
-    int const* input_lengths{bh.input_lengths};
 
     __shared__ int nBeamForNextStep;
     __shared__ float smem_cum_log_probs[MAX_K2 / 2];
@@ -282,7 +281,7 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
         else
         {
             // enough beams in NonEarlyStopping mode
-            int seq_len = bh.seq_len[bid * K] + 1 - input_lengths[gbid * K];
+            int seq_len = bh.seq_len[bid * K] + 1 - bh.input_lengths[gbid * K];
             float const best_sum_logprobs = cta_topk[0].value;
             // According to semantics of HF, cta_topk[0].value is used as best_sum_logprobs
             // But maybe bh.cum_log_probs[bid * K + i] is more suitable?
@@ -290,13 +289,14 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
             if (early_stopping != 0 && length_penalty > 0.0f)
             {
                 // Specialization for early_stopping == "never" and length_penalty > 0 in HF
-                seq_len = bh.max_seq_len - input_lengths[gbid * K];
+                seq_len = bh.max_seq_len - bh.input_lengths[gbid * K];
             }
             float const highest_attainable_score = applyLengthPenalty(best_sum_logprobs, seq_len, length_penalty);
             bh.is_done[bid] = bh.min_normed_scores[gbid] >= highest_attainable_score;
         }
     }
     __syncthreads();
+
     // Update sequence_lengths, parent_ids, output_ids and finished
     __shared__ int s_sequence_lengths[MAX_K2 / 2];
     if (tid < K)
@@ -425,7 +425,7 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__ void beamStage1BaseKernel(T co
     int const* __restrict end_ids)
 {
     // Compare to beamStage1FastKernel, here is no share memory for storage of logits,
-    // and each ThreadBlock is responsible for `V / voc_parts` elements
+    // and each ThreadBlock is responsible for `V / nVocabPart` elements
     constexpr int PACKED_TOP_KMD_SIZE = 2 * MAX_K2 + 2;
     int const tid = threadIdx.x;
     int const bid = blockIdx.x;
@@ -623,10 +623,10 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__ void beamStage1FastKernel(T co
     }
 }
 
-template <typename T, int MAX_K2, int THREADBLOCK_SIZE>
+template <typename T, int MAX_K2, int THREADBLOCK_SIZE, bool IS_FAST_KERNEL>
 __launch_bounds__(THREADBLOCK_SIZE) __global__
-    void beamStage2Kernel(float const* __restrict temp_buffer, float const* __restrict cum_log_probs,
-        int* __restrict topk_id_buffer, T* __restrict topk_val_buffer, int const K, int const voc_parts, int const V)
+    void beamStage2Kernel(float* __restrict temp_buffer, float const* __restrict cum_log_probs,
+        int* __restrict topk_id_buffer, T* __restrict topk_val_buffer, int const K, int const nVocabPart, int const V)
 {
     constexpr int PACKED_TOP_KMD_SIZE = 2 * MAX_K2 + 2;
     int const bid = blockIdx.x;
@@ -637,8 +637,6 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
     using BlockReduceTopK = cub::BlockReduce<cub_kvp, THREADBLOCK_SIZE>;
     using BlockReduceMD = cub::BlockReduce<MD, THREADBLOCK_SIZE>;
 
-    extern __shared__ char smem[];
-    float* smem_topk = reinterpret_cast<float*>(smem);
     __shared__ cub_kvp buf_smem_kv[MAX_K2];
 
     __shared__ union
@@ -655,25 +653,31 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
     auto reduce_md_func = [](const MD& a, const MD& b) { return reduce_md_op(a, b); };
 
     // Load and unpack into registers through smem
-    float const* local_temp_storage = temp_buffer + PACKED_TOP_KMD_SIZE * bid * voc_parts;
-    for (int idx = tid; idx < PACKED_TOP_KMD_SIZE * voc_parts; idx += THREADBLOCK_SIZE)
+    float* local_temp_storage = temp_buffer + PACKED_TOP_KMD_SIZE * bid * nVocabPart;
+    if constexpr (IS_FAST_KERNEL)
     {
-        smem_topk[idx] = local_temp_storage[idx];
+        extern __shared__ char smem[];
+        float* smem_topk = reinterpret_cast<float*>(smem);
+        for (int idx = tid; idx < PACKED_TOP_KMD_SIZE * nVocabPart; idx += THREADBLOCK_SIZE)
+        {
+            smem_topk[idx] = local_temp_storage[idx];
+        }
+        local_temp_storage = smem_topk;
+        __syncthreads();
     }
-    __syncthreads();
 
-    // Find the argmax within each voc_parts
-    // Find the topK across all voc_parts
+    // Find the argmax within each nVocabPart
+    // Find the topK across all nVocabPart
     for (int k = 0; k < 2 * K; ++k)
     {
         cub_kvp partial_topk{V - 1, -MAX_T_VAL};
         // Only threads responsible for a chunk will do the computation
-        if (tid < voc_parts)
+        if (tid < nVocabPart)
         {
             for (int i = 0; i < 2 * K; ++i)
             {
                 int const current_index = tid * PACKED_TOP_KMD_SIZE + i;
-                T current_value = smem_topk[current_index + MAX_K2];
+                T current_value = local_temp_storage[current_index + MAX_K2];
                 cub_kvp new_elem = {current_index, current_value};
                 partial_topk = arg_max(partial_topk, new_elem);
             }
@@ -686,22 +690,22 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
         {
             // Store kv pairs in shared mem buffer
             int temp_offset = total_topk.key;
-            int global_offset = reinterpret_cast<int*>(smem_topk)[temp_offset];
+            int global_offset = reinterpret_cast<int*>(local_temp_storage)[temp_offset];
             total_topk.key = global_offset;
             buf_smem_kv[k] = total_topk;
 
             // Invalidate the maximum value within the chunk
-            reinterpret_cast<int*>(smem_topk)[temp_offset] = V - 1; // id in share memory
-            smem_topk[temp_offset + MAX_K2] = -MAX_T_VAL;           // value in share memory
+            reinterpret_cast<int*>(local_temp_storage)[temp_offset] = V - 1; // id in share memory
+            local_temp_storage[temp_offset + MAX_K2] = -MAX_T_VAL;           // value in share memory
         }
         __syncthreads();
     }
 
     // Extract and reduce MD values across the chunks
-    if (tid < voc_parts)
+    if (tid < nVocabPart)
     {
-        partial_md.d = smem_topk[tid * PACKED_TOP_KMD_SIZE + 2 * MAX_K2];
-        partial_md.m = smem_topk[tid * PACKED_TOP_KMD_SIZE + 2 * MAX_K2 + 1];
+        partial_md.d = local_temp_storage[tid * PACKED_TOP_KMD_SIZE + 2 * MAX_K2];
+        partial_md.m = local_temp_storage[tid * PACKED_TOP_KMD_SIZE + 2 * MAX_K2 + 1];
     }
     __syncthreads();
 
@@ -723,33 +727,43 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
     }
 }
 
+#define BEAM_STAGE2_KERNEL(N_VOCAB_PART, IS_FAST_KERNEL)                                                               \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (IS_FAST_KERNEL && smem_size >= (48 << 10))                                                                                   \
+        {                                                                                                              \
+            TLLM_CUDA_CHECK(cudaFuncSetAttribute(beamStage2Kernel<T, MAX_K2, N_VOCAB_PART, IS_FAST_KERNEL>,            \
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));                                              \
+        }                                                                                                              \
+        beamStage2Kernel<T, MAX_K2, N_VOCAB_PART, IS_FAST_KERNEL>                                                      \
+            <<<batch_size * beam_width, N_VOCAB_PART, IS_FAST_KERNEL * smem_size, stream>>>(                           \
+                temp_buffer, cum_log_probs, topk_id_buffer, topk_val_buffer, beam_width, nVocabPart, V);               \
+    } while (0);                                                                                                       \
+    return;
+
 template <typename T, int MAX_K2>
-void beamStage2KernelLauncher(float const* temp_buffer, float const* cum_log_probs, int* topk_id_buffer,
-    T* topk_val_buffer, int const batch_size, int const beam_width, int const voc_parts, int const V,
+void beamStage2KernelLauncher(float* temp_buffer, float const* cum_log_probs, int* topk_id_buffer, T* topk_val_buffer,
+    int const batch_size, int const beam_width, int const nVocabPart, int const V, int const max_smem_per_block,
     cudaStream_t stream)
 {
     // TODO: rewrite kernel to remove dependence of constant block size to reduce compilation time
-    size_t const smem_size = sizeof(float) * voc_parts * (2 * MAX_K2 + 2);
-
-    if (voc_parts <= 32)
+    size_t const smem_size = sizeof(float) * nVocabPart * (2 * MAX_K2 + 2) + sizeof(cub::KeyValuePair<int, T>) * MAX_K2;
+    printf("[wili]V=%d, nVocabPart=%d, smem_size=%d, max_smem_per_block=%d, is_fast=%d\n", \
+        V, nVocabPart, smem_size, max_smem_per_block, smem_size < max_smem_per_block);
+    if (smem_size < max_smem_per_block) // IS_FAST_KERNEL must be a compilation-time constant
     {
-        beamStage2Kernel<T, MAX_K2, 32><<<batch_size * beam_width, 32, smem_size, stream>>>(
-            temp_buffer, cum_log_probs, topk_id_buffer, topk_val_buffer, beam_width, voc_parts, V);
-        return;
+        if (nVocabPart <= 32)
+        {
+            BEAM_STAGE2_KERNEL(32, true)
+        }
+        if (nVocabPart <= 64)
+        {
+            BEAM_STAGE2_KERNEL(64, true)
+        }
+        BEAM_STAGE2_KERNEL(128, true)
+        // No larger branch since nVocabPart <= nMaxVocabPartForStage1FastKernel
     }
-    if (voc_parts <= 64)
-    {
-        beamStage2Kernel<T, MAX_K2, 64><<<batch_size * beam_width, 64, smem_size, stream>>>(
-            temp_buffer, cum_log_probs, topk_id_buffer, topk_val_buffer, beam_width, voc_parts, V);
-        return;
-    }
-    if (voc_parts <= 128)
-    {
-        beamStage2Kernel<T, MAX_K2, 128><<<batch_size * beam_width, 128, smem_size, stream>>>(
-            temp_buffer, cum_log_probs, topk_id_buffer, topk_val_buffer, beam_width, voc_parts, V);
-        return;
-    }
-    assert(0);
+    BEAM_STAGE2_KERNEL(128, false)
 }
 
 template <typename T, int MAX_K>
@@ -758,10 +772,10 @@ void topK_softMax_kernelLauncher(
 {
     // Workflow of this function (reference: https://github.com/NVIDIA/online-softmax)
     // Using batch_size (BS) = 2, beam_width (BM) = 5, vocab_size (V) = 32000 as an example:
-    // nPaddedBeamWidth (pBM) = 8 = 2 ^ ceil(log(BM)), nSmallTopKMaxVocParts (nVP) = 128 (Constant)
+    // nPaddedBeamWidth (pBM) = 8 = 2 ^ ceil(log(BM)), nMaxVocabPartForStage1FastKernel (nVP) = 128 (Constant)
     // MAX_K = 8 = pBM, MAX_K2 = 16 = 2 * pBM
     // logits.shape = [BS, BM, V]
-    // blockSize = 128, voc_parts = 13, voc_size_chunk = 2462 = ceil(32000/13)
+    // blockSize = 128, nVocabPart = 13, voc_size_chunk = 2462 = ceil(32000/13)
 
     // The content of workspace (length aligned to 4):
     //                    | allocated size                      | used size              | data type |
@@ -773,12 +787,12 @@ void topK_softMax_kernelLauncher(
     // ┃ temp_buffer     ┃ BS * pBM * nVP * (2 * (pBM * 2) + 2) |                        | float     |
     // ┗━━━━━━━━━━━━━━━━━┛ ---------------------------------------------------------------------------
 
-    // Stage1: gridDim(BS*BM,voc_parts,1), blockDim(blockSize,1,1)
+    // Stage1: gridDim(BS*BM,nVocabPart,1), blockDim(blockSize,1,1)
     // Each ThreadBlock takes `voc_size_chunk` contiguous elements in logits to do TopK and reduce_md,
     //   then writes output into temp_buffer.
     // At end of this kernel, each ThreadBlock holds the indexes and values of the top 2*K elements,
     //   as well as the m(x) and l(x) of those elements (see paper of Flash Attention, arXiv:2205.14135)
-    // temp_buffer.shape = [BS*BM, voc_parts, 2*MAX_K2+2]
+    // temp_buffer.shape = [BS*BM, nVocabPart, 2*MAX_K2+2]
     // The content of the last dimension of temp_buffer (updated by each ThreadBlock, we call it "Tile"):
     //                  ┏━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━┓
     //                  ┃ topk_id ┃ topk_val ┃ md    ┃
@@ -788,7 +802,7 @@ void topK_softMax_kernelLauncher(
     // | data type      | int     | float    | float |
 
     // Stage2: gridDim(BS*BM,1,1), blockDim(32/64/128,1,1)
-    // Each TheadBlock takes `voc_parts` contiguous Tiles in temp_buffer to do reduce_topk and reduce_md,
+    // Each TheadBlock takes `nVocabPart` contiguous Tiles in temp_buffer to do reduce_topk and reduce_md,
     //   writes output topk_id into in topk_id_buffer, writes topk_value + cum_log_probs into topk_val_buffer.
 
     // batchBeamKernel: gridDim(BS,1,1), blockDim(128,1,1)
@@ -798,7 +812,7 @@ void topK_softMax_kernelLauncher(
     //   + maintains related score array, min_normed_score / is_done / finished, etc..
 
     constexpr int items_per_thread = 1;
-    constexpr int blockSize = (MAX_K < 16) ? ((MAX_K < 8) ? nSmallTopKBlockSize : 128) : 64;
+    constexpr int blockSize = (MAX_K < 16) ? ((MAX_K < 8) ? nBlockSizeForSmallBeamWidth : 128) : 64;
     int const batch_size{bh.local_batch_size};
     int const beam_width{bh.beam_width};
     int const V{bh.vocab_size};
@@ -827,60 +841,61 @@ void topK_softMax_kernelLauncher(
     cudaFuncAttributes attr;
     TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attr, beamStage1FastKernel<T, items_per_thread, 2 * MAX_K, blockSize>));
 
-    // One ThreadBlock must at least have share memory of `sizeof(T) * V / nSmallTopKMaxVocParts` bytes
+    // One ThreadBlock must at least have share memory of `sizeof(T) * V / nMaxVocabPartForStage1FastKernel` bytes
     int const static_smem = attr.sharedSizeBytes;
     int const max_dyn_smem_per_block = max_smem_per_block - static_smem;
-    TLLM_CHECK_WITH_INFO(sizeof(T) * V <= max_dyn_smem_per_block * nSmallTopKMaxVocParts,
+    TLLM_CHECK_WITH_INFO(sizeof(T) * V <= max_dyn_smem_per_block * nMaxVocabPartForStage1FastKernel,
         "Vocab size is too large for split-k TopK beam search fast path.");
 
-    // Find the maximum of ThreadBlock (maximum of voc_parts, minimum of smem),
-    // satisfying voc_parts <= nSmallTopKMaxVocParts && dyn_smem_size * voc_parts >= sizeof(T) * V
+    // Find the maximum of ThreadBlock (maximum of nVocabPart, minimum of smem),
+    // satisfying nVocabPart <= nMaxVocabPartForStage1FastKernel && dyn_smem_size * nVocabPart >= sizeof(T) * V
     int const driver_smem_per_block = max_smem_per_sm - max_smem_per_block;
     int const extra_smem = driver_smem_per_block + static_smem;
-    int voc_parts = nSmallTopKMaxVocParts + 1;
-    for (int n_block = max_active_blocks - 1; n_block > 0 && voc_parts > nSmallTopKMaxVocParts; --n_block)
+
+    int nVocabPart = nMaxVocabPartForStage1FastKernel + 1;
+    for (int n_block = max_active_blocks - 1; n_block > 0 && nVocabPart > nMaxVocabPartForStage1FastKernel; --n_block)
     {
-        int smem_per_block = max_smem_per_sm / n_block;
-        int dyn_smem_size = smem_per_block - extra_smem;
+        int dyn_smem_size = max_smem_per_sm / n_block - extra_smem;
         dyn_smem_size -= dyn_smem_size % sizeof(T);
-        voc_parts = (sizeof(T) * V + dyn_smem_size - 1) / dyn_smem_size;
+        nVocabPart = ceilDiv(sizeof(T) * V, dyn_smem_size);
     }
 
-    if (voc_parts <= nSmallTopKMaxVocParts)
+    if (nVocabPart <= nMaxVocabPartForStage1FastKernel)
     {
         // Use stage 1 fast kernel
-        int const voc_size_chunk = (V + voc_parts - 1) / voc_parts;
+        int const voc_size_chunk = (V + nVocabPart - 1) / nVocabPart;
         int const dyn_smem_size = sizeof(T) * voc_size_chunk;
         if (dyn_smem_size >= (48 << 10))
         {
             TLLM_CUDA_CHECK(cudaFuncSetAttribute(beamStage1FastKernel<T, items_per_thread, 2 * MAX_K, blockSize>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, dyn_smem_size));
         }
-        dim3 gridSize(batch_size * beam_width, voc_parts);
+        dim3 gridSize(batch_size * beam_width, nVocabPart);
         beamStage1FastKernel<T, items_per_thread, 2 * MAX_K, blockSize><<<gridSize, blockSize, dyn_smem_size, stream>>>(
             logits, bias, finished, temp_buffer, V, beam_width, end_ids, voc_size_chunk);
     }
     else
     {
-        // use stage 1 base kernel
-        int voc_parts = 4;
+        // use stage 1 base kernel, useless branch now
+        int nVocabPart = 4;
         if (batch_size * beam_width < 256)
         {
             // TODO: add heuristics for base stage 1 kernel
             // Volta has 80 SMs, so we aim for three waves
-            voc_parts = (240 + batch_size * beam_width - 1) / (batch_size * beam_width);
-            voc_parts = std::min(128, voc_parts); // we implement up to 128
+            nVocabPart = (240 + batch_size * beam_width - 1) / (batch_size * beam_width);
+            nVocabPart = std::min(128, nVocabPart); // we implement up to 128
         }
         cudaFuncSetAttribute(beamStage1BaseKernel<T, items_per_thread, 2 * MAX_K, blockSize>,
             cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxL1);
-        dim3 gridSize(batch_size * beam_width, voc_parts);
+        dim3 gridSize(batch_size * beam_width, nVocabPart);
         beamStage1BaseKernel<T, items_per_thread, 2 * MAX_K, blockSize>
             <<<gridSize, blockSize, 0, stream>>>(logits, bias, finished, temp_buffer, V, beam_width, end_ids);
     }
     sync_check_cuda_error();
 
-    beamStage2KernelLauncher<T, 2 * MAX_K>(
-        temp_buffer, cum_log_probs, topk_id_buffer, topk_val_buffer, batch_size, beam_width, voc_parts, V, stream);
+    beamStage2KernelLauncher<T, 2 * MAX_K>(temp_buffer, cum_log_probs, topk_id_buffer, topk_val_buffer, batch_size,
+        beam_width, nVocabPart, V, max_smem_per_block, stream);
+
 #else
     beamKernel<T, items_per_thread, MAX_K, blockSize><<<batch_size * beam_width, blockSize, 0, stream>>>(
         logits, bias, cum_log_probs, finished, topk_id_buffer, topk_val_buffer, V, beam_width, end_ids);
@@ -890,14 +905,15 @@ void topK_softMax_kernelLauncher(
 
     // Keep 2 * beam_width candidates in case of k candidates finishes in one iteration
     size_t const smem_size = sizeof(T) * beam_width * beam_width * 2;
-
+    size_t constexpr block_size = (MAX_K + 31) / 32 * 32; // can not use `roundUp()`
     if (smem_size >= (48 << 10))
     {
         TLLM_CUDA_CHECK(cudaFuncSetAttribute(
-            batchBeamKernel<T, MAX_K * 2, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            batchBeamKernel<T, MAX_K * 2, block_size>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     }
 
-    batchBeamKernel<T, MAX_K * 2, 32><<<batch_size, 32, smem_size, stream>>>(topk_id_buffer, topk_val_buffer, bh);
+    batchBeamKernel<T, MAX_K * 2, block_size>
+        <<<batch_size, block_size, smem_size, stream>>>(topk_id_buffer, topk_val_buffer, bh);
     sync_check_cuda_error();
 }
 
